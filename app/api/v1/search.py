@@ -1,0 +1,91 @@
+"""
+SKONGA Library API — Search Endpoint
+=======================================
+POST /internal/v1/search
+"""
+import time
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.core.logging import log_request
+from app.core.security import verify_service_token
+from app.db.session import get_db
+from app.retrieval.keyword_search import search_topics
+
+router = APIRouter(prefix="/search", tags=["Search"])
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500)
+    subject_id: str | None = None
+    form_id: int | None = Field(None, ge=1, le=6)
+    top_k: int = Field(default=5, ge=1, le=20)
+    include_content: bool = Field(
+        default=False,
+        description="Search results usually only need metadata; set True to pull content_md.",
+    )
+
+
+class SearchResult(BaseModel):
+    id: str
+    subject_id: str
+    form_id: int
+    title_en: str
+    title_sw: str
+    difficulty: str | None
+    relevance: float
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResult]
+    retrieval_mode: str
+    took_ms: float
+    total: int
+
+
+@router.post("", response_model=SearchResponse)
+def search(
+    body: SearchRequest,
+    db: Session = Depends(get_db),
+    _token: str = Depends(verify_service_token),
+):
+    start = time.perf_counter()
+
+    results, mode = search_topics(
+        db=db,
+        query=body.query,
+        subject_id=body.subject_id,
+        form_id=body.form_id,
+        top_k=body.top_k,
+        include_content=body.include_content,
+    )
+
+    took_ms = (time.perf_counter() - start) * 1000
+    log_request(
+        endpoint="/search",
+        status_code=200,
+        took_ms=took_ms,
+        extra={"retrieval_mode": mode, "results": len(results)},
+    )
+
+    slim = [
+        {
+            "id": r["id"],
+            "subject_id": r["subject_id"],
+            "form_id": r["form_id"],
+            "title_en": r["title_en"],
+            "title_sw": r["title_sw"],
+            "difficulty": r.get("difficulty"),
+            "relevance": float(r.get("relevance") or 0),
+        }
+        for r in results
+    ]
+
+    return {
+        "results": slim,
+        "retrieval_mode": mode,
+        "took_ms": round(took_ms, 2),
+        "total": len(slim),
+    }
